@@ -1,0 +1,74 @@
+name: gwasphere
+
+channels:
+  - conda-forge
+  - bioconda
+
+dependencies:
+  - python=3.11
+  - pip
+  - parallel
+  - bcftools
+  - plink
+  - plink2
+  - tabix
+  - bedtools
+  - numpy>=2.0
+  - pandas
+  - scipy
+  - matplotlib
+  - requests
+  - openpyxl
+  - xlrd
+
+  # R base
+  - r-base=4.4
+  - r-biocmanager
+
+  # Shiny & UI
+  - r-shiny
+  - r-shinywidgets
+  - r-shinydashboard
+  - r-shinybs
+  - r-later
+  - r-bslib
+
+  # Data manipulation
+  - r-dt
+  - r-data.table
+  - r-dplyr
+  - r-tidyr
+  - r-tidyverse
+  - r-stringr
+  - r-forcats
+  - r-readxl
+  - r-openxlsx
+  - r-jsonlite
+  - r-digest
+  - r-httr
+  - r-xml
+  - r-base64enc
+  - r-htmlwidgets
+
+  # Visualization
+  - r-ggplot2
+  - r-ggrepel
+  - r-gggenes
+  - r-patchwork
+  - r-plotly
+  - r-paletteer
+
+  # Bioinformatics (Bioconductor)
+  - bioconductor-annotationdbi
+  - bioconductor-biomart
+  - bioconductor-org.hs.eg.db
+  - bioconductor-ramwas
+
+  # Other
+  - r-rentrez
+  - r-quarto
+  - r-zip
+
+  - pip:
+    - gwaslab==4.2.3
+    - "numpy>=2.0"

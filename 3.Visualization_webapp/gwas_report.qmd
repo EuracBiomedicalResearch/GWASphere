@@ -1,0 +1,1282 @@
+---
+title: "GWAS Results Report"
+format:
+  html:
+    toc: false
+    anchor-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    margin-left: 10px
+    margin-right: 10px
+    grid:
+      body-width: 1400px
+      sidebar-width: 0px
+      margin-width: 0px
+params:
+  snapshot_path: null
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+library(data.table)
+library(DT)
+library(ggplot2)
+library(htmltools)
+library(htmlwidgets)
+library(jsonlite)
+library(readxl)
+
+snapshot <- readRDS(params$snapshot_path)
+report_root <- dirname(normalizePath(params$snapshot_path))
+assets_root <- file.path(report_root, "assets")
+dir.create(assets_root, recursive = TRUE, showWarnings = FALSE)
+
+`%||%` <- function(x, y) if (is.null(x) || length(x) == 0L) y else x
+
+slug <- function(x) {
+  x <- gsub("[^A-Za-z0-9_.-]+", "_", as.character(x))
+  gsub("^_+|_+$", "", x)
+}
+
+safe_fread <- function(path) {
+  if (is.null(path) || is.na(path) || !file.exists(path)) return(data.table())
+  tryCatch(fread(path, skip = "VARIABLE"), error = function(e) {
+    tryCatch(fread(path), error = function(e2) data.table())
+  })
+}
+
+paths_for <- function(base_dir) {
+  regenie_input_file <- file.path(base_dir, "regenie_input_dir.txt")
+  regenie_input_dir <- if (file.exists(regenie_input_file)) {
+    trimws(readLines(regenie_input_file, warn = FALSE)[1])
+  } else NULL
+
+  list(
+    loci = file.path(base_dir, "loci", "ALL_TRAITS.loci_table.tsv"),
+    loci_rsid = file.path(base_dir, "loci", "ALL_TRAITS.loci_table_with_rsid.tsv"),
+    candidate_dir = file.path(base_dir, "ld", "candidate_snps"),
+    gwas_catalog_dir = file.path(base_dir, "novelty_check"),
+    pubmed_dir = file.path(base_dir, "novelty_check", "PubMed"),
+    snpeff_dir = file.path(base_dir, "SnpEff"),
+    snpeff_prop = file.path(base_dir, "SnpEff", "all_trait_prop.tsv"),
+    magma_dir = file.path(base_dir, "magma"),
+    mh_dir = file.path(base_dir, "mh_plots"),
+    qq_dir = file.path(base_dir, "qqplot"),
+    locuszoom_dir = file.path(base_dir, "LZplot"),
+    gene_mh_dir = file.path(base_dir, "mh_plots_gene"),
+    tophits_dir = if (!is.null(regenie_input_dir)) file.path(regenie_input_dir, "tophits") else NULL
+  )
+}
+
+read_run_params <- function(base_dir) {
+  path <- file.path(base_dir, "run_params.json")
+  if (!file.exists(path)) return(NULL)
+  tryCatch(jsonlite::read_json(path), error = function(e) NULL)
+}
+
+get_novelty_method <- function(base_dir, trait) {
+  params <- read_run_params(base_dir)
+  if (is.null(params)) return("Method not recorded (run_params.json not found)")
+
+  nv <- params$novelty
+  trait_map <- nv$trait_map_xlsx %||% ""
+  def_str   <- nv$default_trait_string %||% ""
+
+  if (nzchar(trait_map) && trait_map != "path/to/file/" && file.exists(trait_map)) {
+    tryCatch({
+      # Read trait map — support xlsx, csv, tsv
+      suffix <- tolower(tools::file_ext(trait_map))
+      tm <- if (suffix %in% c("xlsx", "xls")) {
+        readxl::read_excel(trait_map)
+      } else if (suffix == "csv") {
+        read.csv(trait_map, stringsAsFactors = FALSE)
+      } else {
+        read.delim(trait_map, stringsAsFactors = FALSE)
+      }
+      colnames(tm) <- tolower(trimws(colnames(tm)))
+      col_trait   <- names(tm)[tolower(names(tm)) == "trait"][1]
+      col_efo     <- names(tm)[tolower(names(tm)) == "efo_id"][1]
+      col_catalog <- names(tm)[tolower(names(tm)) %in% c("gwas_catalog_trait", "catalog_trait")][1]
+
+      if (!is.na(col_trait)) {
+        row <- tm[trimws(as.character(tm[[col_trait]])) == trait, ]
+        if (nrow(row) > 0) {
+          catalog_label <- if (!is.na(col_catalog)) trimws(as.character(row[[col_catalog]][1])) else NA
+          efo           <- if (!is.na(col_efo))     trimws(as.character(row[[col_efo]][1]))     else NA
+          display <- if (!is.na(catalog_label) && nzchar(catalog_label) && catalog_label != "NA") {
+            catalog_label
+          } else trimws(as.character(row[[col_trait]][1]))
+          if (!is.na(efo) && nzchar(efo) && efo != "NA") {
+            return(paste0("EFO-based matching: <strong>", htmlEscape(display),
+                         "</strong> (EFO: ", htmlEscape(efo), ")"))
+          } else {
+            return(paste0("EFO-based matching: <strong>", htmlEscape(display), "</strong>"))
+          }
+        }
+      }
+    }, error = function(e) NULL)
+  }
+
+  if (nzchar(def_str)) {
+    return(paste0("String-based matching: <strong>", htmlEscape(def_str), "</strong>"))
+  }
+  "Matching method not specified"
+}
+
+find_snp_col <- function(dt) {
+  if (!nrow(dt)) return(NA_character_)
+  clean <- toupper(gsub("[^A-Za-z0-9]+", "", names(dt)))
+  hit <- match(c("CANDIDATESNP", "RSID", "SNP", "ID"), clean, nomatch = 0)
+  if (any(hit > 0)) names(dt)[hit[hit > 0][1]] else NA_character_
+}
+
+candidate_p_col <- function(dt) {
+  hit <- which(toupper(gsub("[^A-Za-z0-9]+", "", names(dt))) == "CANDIDATEP")
+  if (length(hit)) names(dt)[hit[1]] else NA_character_
+}
+
+list_traits <- function(base_dir) {
+  p <- paths_for(base_dir)
+  traits <- character()
+  if (dir.exists(p$mh_dir)) {
+    f <- list.files(p$mh_dir, pattern = "_mh(_maffilt)?\\.html$")
+    f <- f[!grepl("^combined_mh", f)]
+    traits <- c(traits, sub("_mh(_maffilt)?\\.html$", "", f))
+  }
+  if (dir.exists(p$candidate_dir)) {
+    f <- list.files(p$candidate_dir, pattern = "\\.candidate_snps\\.tsv$")
+    traits <- c(traits, sub("\\.candidate_snps\\.tsv$", "", f))
+  }
+  if (dir.exists(p$qq_dir)) {
+    f <- list.files(p$qq_dir, pattern = "_qqplot\\.png$", ignore.case = TRUE)
+    traits <- c(traits, sub("_qqplot\\.png$", "", f, ignore.case = TRUE))
+  }
+  if (dir.exists(p$gwas_catalog_dir)) {
+    f <- list.files(p$gwas_catalog_dir, pattern = "_novel\\.tsv$")
+    traits <- c(traits, sub("_novel\\.tsv$", "", f))
+  }
+  if (dir.exists(p$pubmed_dir)) {
+    f <- list.files(p$pubmed_dir, pattern = "_pubmed\\.tsv$")
+    traits <- c(traits, sub("_pubmed\\.tsv$", "", f))
+  }
+  if (dir.exists(p$snpeff_dir)) {
+    f <- list.files(p$snpeff_dir, pattern = "_snpeff_refined\\.tsv$", recursive = TRUE)
+    traits <- c(traits, sub("_snpeff_refined\\.tsv$", "", basename(f)))
+  }
+  magma_specs <- list(
+    c("gene_analysis", "\\.genes\\.symbol\\.tsv$"),
+    c("gene_set_analysis", "\\.gsa\\.out$"),
+    c("tissue_analysis", "\\.gsa\\.out$")
+  )
+  for (spec in magma_specs) {
+    d <- file.path(p$magma_dir, spec[1])
+    if (dir.exists(d)) {
+      f <- list.files(d, pattern = spec[2])
+      traits <- c(traits, sub(spec[2], "", f))
+    }
+  }
+  loci_dt <- safe_fread(if (file.exists(p$loci_rsid)) p$loci_rsid else p$loci)
+  if (nrow(loci_dt) && "trait" %in% names(loci_dt)) {
+    traits <- c(traits, as.character(loci_dt$trait))
+  }
+  sort(unique(traits))
+}
+
+read_candidates <- function(base_dir, trait, format_p = TRUE) {
+  dt <- safe_fread(file.path(paths_for(base_dir)$candidate_dir,
+                             paste0(trait, ".candidate_snps.tsv")))
+  p_col <- candidate_p_col(dt)
+  if (!nrow(dt) || is.na(p_col) || !format_p) return(dt)
+  pos <- match(p_col, names(dt))
+  p <- suppressWarnings(as.numeric(dt[[p_col]]))
+  dt[, `-log10P (candidate SNP)` := round(-log10(pmax(p, .Machine$double.xmin)), 3)]
+  dt[, (p_col) := NULL]
+  new_order <- append(setdiff(names(dt), "-log10P (candidate SNP)"),
+                      "-log10P (candidate SNP)", after = pos - 1)
+  setcolorder(dt, new_order)
+  dt
+}
+
+read_trait_loci <- function(base_dir, trait) {
+  p <- paths_for(base_dir)
+  dt <- safe_fread(p$loci_rsid)
+  if (!nrow(dt)) dt <- safe_fread(p$loci)
+  if (!nrow(dt) || !"trait" %in% names(dt)) return(data.table())
+  selected_trait <- as.character(trait)
+  dt[as.character(get("trait")) == selected_trait]
+}
+
+read_optional_sections <- function(base_dir, trait) {
+  p <- paths_for(base_dir)
+  snpeff_1 <- file.path(p$snpeff_dir, paste0(trait, "_snpeff_refined.tsv"))
+  snpeff_2 <- file.path(p$snpeff_dir, "output", paste0(trait, "_snpeff_refined.tsv"))
+
+  list(
+    novelty = safe_fread(file.path(p$gwas_catalog_dir, paste0(trait, "_novel.tsv"))),
+    other_traits = safe_fread(file.path(
+      p$gwas_catalog_dir, paste0(trait, "_othertraits_in_window.tsv")
+    )),
+    pubmed = safe_fread(file.path(p$pubmed_dir, paste0(trait, "_pubmed.tsv"))),
+    snpeff = if (file.exists(snpeff_1)) safe_fread(snpeff_1) else safe_fread(snpeff_2),
+    magma_genes = safe_fread(file.path(
+      p$magma_dir, "gene_analysis", paste0(trait, ".genes.symbol.tsv")
+    )),
+    magma_genesets = safe_fread(file.path(
+      p$magma_dir, "gene_set_analysis", paste0(trait, ".gsa.out")
+    )),
+    magma_tissues = safe_fread(file.path(
+      p$magma_dir, "tissue_analysis", paste0(trait, ".gsa.out")
+    ))
+  )
+}
+
+read_snpeff_proportions <- function(base_dir, trait) {
+  dt <- safe_fread(paths_for(base_dir)$snpeff_prop)
+  if (!nrow(dt) || !"trait" %in% names(dt)) return(dt)
+  selected_trait <- as.character(trait)
+  dt[as.character(get("trait")) == selected_trait]
+}
+
+find_p_column <- function(dt) {
+  if (!nrow(dt)) return(NA_character_)
+  clean <- toupper(gsub("[^A-Za-z0-9]+", "", names(dt)))
+  priority <- c("P", "PVAL", "PVALUE", "PJOINT", "PSELF", "PCOND", "PFULL")
+  hit <- match(priority, clean, nomatch = 0)
+  if (any(hit > 0)) return(names(dt)[hit[hit > 0][1]])
+  p_like <- grep("^P", clean)
+  if (length(p_like)) names(dt)[p_like[1]] else NA_character_
+}
+
+find_label_column <- function(dt, candidates) {
+  if (!ncol(dt)) return(NA_character_)
+  clean <- toupper(gsub("[^A-Za-z0-9]+", "", names(dt)))
+  wanted <- toupper(gsub("[^A-Za-z0-9]+", "", candidates))
+  hit <- match(wanted, clean, nomatch = 0)
+  if (any(hit > 0)) names(dt)[hit[hit > 0][1]] else names(dt)[1]
+}
+
+make_magma_plot <- function(dt, label_candidates, title, top_n = 20) {
+  if (!nrow(dt)) return(NULL)
+  p_col <- find_p_column(dt)
+  label_col <- find_label_column(dt, label_candidates)
+  if (is.na(p_col) || is.na(label_col)) return(NULL)
+  plot_dt <- copy(dt)
+  plot_dt[, p_numeric := suppressWarnings(as.numeric(get(p_col)))]
+  plot_dt <- plot_dt[is.finite(p_numeric) & p_numeric > 0]
+  if (!nrow(plot_dt)) return(NULL)
+  plot_dt[, score := -log10(p_numeric)]
+  # Use ENTREZID/first col as fallback when label is NA
+  plot_dt[, label_raw := as.character(get(label_col))]
+  fallback_col <- names(plot_dt)[1]
+  plot_dt[is.na(label_raw) | label_raw == "NA" | !nzchar(label_raw),
+          label_raw := as.character(get(fallback_col))]
+  plot_dt <- plot_dt[!is.na(label_raw) & label_raw != "NA" & nzchar(label_raw)]
+  if (!nrow(plot_dt)) return(NULL)
+  setorder(plot_dt, -score)
+  plot_dt <- head(plot_dt, top_n)
+  plot_dt[, label := factor(label_raw, levels = rev(label_raw))]
+  ggplot(plot_dt, aes(label, score)) +
+    geom_col(fill = "#D64550") +
+    coord_flip() +
+    labs(x = NULL, y = "-log10(P)", title = title) +
+    theme_minimal(base_size = 11) +
+    theme(panel.grid.minor = element_blank())
+}
+
+
+add_log10p_and_sort <- function(dt) {
+  dt <- copy(dt)
+  p_col_idx <- which(toupper(gsub("[^A-Za-z0-9]+", "", names(dt))) %in% c("P","PVAL","PVALUE"))
+  if (length(p_col_idx)) {
+    p_col_name <- names(dt)[p_col_idx[1]]
+    dt[, `-log10(P)` := round(-log10(suppressWarnings(as.numeric(get(p_col_name)))), 4)]
+    new_order <- append(setdiff(names(dt), "-log10(P)"), "-log10(P)", after = p_col_idx[1])
+    setcolorder(dt, new_order)
+    dt <- dt[order(suppressWarnings(as.numeric(get(p_col_name))))]
+  }
+  dt
+}
+
+find_locuszoom <- function(base_dir, trait, lead) {
+  lz_dir <- paths_for(base_dir)$locuszoom_dir
+  if (!dir.exists(lz_dir)) return(NA_character_)
+  safe_trait <- slug(trait)
+  safe_lead <- slug(lead)
+  files <- list.files(lz_dir, pattern = "\\.html$", full.names = TRUE)
+  exact <- files[basename(files) == paste0(safe_trait, "_", safe_lead, ".html")]
+  if (length(exact)) return(exact[1])
+  hit <- files[
+    grepl(paste0("^", safe_trait, "_"), basename(files)) &
+    grepl(safe_lead, basename(files), fixed = TRUE)
+  ]
+  if (length(hit)) hit[1] else NA_character_
+}
+
+find_qq <- function(base_dir, trait) {
+  qdir <- paths_for(base_dir)$qq_dir
+  if (!dir.exists(qdir)) return(NA_character_)
+  files <- list.files(qdir, pattern = "\\.png$", full.names = TRUE)
+  safe_trait <- slug(trait)
+  hit <- files[grepl(safe_trait, basename(files), fixed = TRUE) &
+                 grepl("qq", basename(files), ignore.case = TRUE)]
+  if (length(hit)) hit[1] else NA_character_
+}
+
+relative_asset <- function(...) file.path("assets", ...)
+
+copy_html_asset <- function(source, dataset_key, trait_key) {
+  if (!file.exists(source)) return(NA_character_)
+  rel_dir <- relative_asset(dataset_key, trait_key, "manhattan")
+  out_dir <- file.path(report_root, rel_dir)
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  file.copy(source, file.path(out_dir, basename(source)), overwrite = TRUE)
+
+  dependency_dir <- paste0(tools::file_path_sans_ext(source), "_files")
+  if (dir.exists(dependency_dir)) {
+    file.copy(dependency_dir, out_dir, recursive = TRUE, overwrite = TRUE)
+  }
+  file.path(rel_dir, basename(source))
+}
+
+copy_qq_asset <- function(source, dataset_key, trait_key) {
+  if (is.na(source) || !file.exists(source)) return(NA_character_)
+  rel_dir <- relative_asset(dataset_key, trait_key)
+  out_dir <- file.path(report_root, rel_dir)
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  destination <- file.path(out_dir, basename(source))
+  file.copy(source, destination, overwrite = TRUE)
+  file.path(rel_dir, basename(source))
+}
+
+copy_locuszoom_asset <- function(source, dataset_key, trait_key, lead_key) {
+  if (is.na(source) || !file.exists(source)) return(NA_character_)
+  rel_dir <- relative_asset(dataset_key, trait_key, "locuszoom", lead_key)
+  out_dir <- file.path(report_root, rel_dir)
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  destination <- file.path(out_dir, basename(source))
+  file.copy(source, destination, overwrite = TRUE)
+
+  dependency_dir <- paste0(tools::file_path_sans_ext(source), "_files")
+  if (dir.exists(dependency_dir)) {
+    file.copy(dependency_dir, out_dir, recursive = TRUE, overwrite = TRUE)
+  }
+  file.path(rel_dir, basename(source))
+}
+
+normalise_table_for_display <- function(dt) {
+  x <- as.data.table(copy(dt))
+  clean_names <- as.character(names(x))
+  clean_names[is.na(clean_names) | !nzchar(clean_names)] <- "column"
+  setnames(x, make.unique(clean_names, sep = "_"))
+  for (nm in names(x)) {
+    value <- x[[nm]]
+    if (is.list(value)) {
+      value <- vapply(seq_len(nrow(x)), function(i) {
+        v <- unlist(value[[i]], recursive = TRUE, use.names = FALSE)
+        paste(as.character(v[!is.na(v)]), collapse = "; ")
+      }, character(1))
+    } else if (inherits(value, c("integer64","POSIXct","POSIXlt","Date","IDate","difftime")) ||
+               is.factor(value) || !is.atomic(value)) {
+      value <- as.character(value)
+    }
+    if (!is.character(value)) value <- as.character(value)
+    value[is.na(value)] <- ""
+    set(x, j = nm, value = value)
+  }
+  as.data.frame(x, stringsAsFactors = FALSE, check.names = FALSE)
+}
+
+save_table_asset <- function(dt, rel_file) {
+  if (!nrow(dt)) return(NA_character_)
+  absolute_file <- file.path(report_root, rel_file)
+  dir.create(dirname(absolute_file), recursive = TRUE, showWarnings = FALSE)
+  widget <- datatable(
+    dt, rownames = FALSE, filter = "top",
+    options = list(pageLength = 20, scrollX = TRUE, deferRender = TRUE)
+  )
+  saveWidget(widget, absolute_file, selfcontained = FALSE, title = "GWAS table")
+  rel_file
+}
+
+emit_iframe <- function(src, height = 560) {
+  if (is.na(src)) {
+    cat("<p class='text-muted'>Not available.</p>\n\n")
+  } else {
+    cat(sprintf(
+      "<iframe src='%s' style='width:100%%;height:%dpx;border:1px solid #ddd;border-radius:4px;'></iframe>\n\n",
+      htmlEscape(src, attribute = TRUE), height
+    ))
+  }
+}
+
+emit_table_iframe <- function(src, n_rows = NULL) {
+  if (is.na(src)) {
+    cat("<p class='text-muted'>Not available.</p>\n\n")
+    return(invisible())
+  }
+  # Auto-size based on rows: ~28px per row + 120px overhead, min 180, max 650
+  if (!is.null(n_rows)) {
+    height <- max(180, min(650, min(n_rows, 20) * 28 + 120))
+  } else {
+    height <- 400
+  }
+  cat(sprintf(
+    "<iframe src='%s' style='width:100%%;height:%dpx;border:1px solid #ddd;border-radius:4px;'></iframe>\n\n",
+    htmlEscape(src, attribute = TRUE), height
+  ))
+}
+
+emit_image <- function(src) {
+  if (is.na(src)) {
+    cat("<p class='text-muted'>QQ plot not available.</p>\n\n")
+  } else {
+    cat(sprintf(
+      "<img src='%s' style='display:block;max-width:480px;width:100%%;height:auto;margin:0 auto;' alt='QQ plot'>\n\n",
+      htmlEscape(src, attribute = TRUE)
+    ))
+  }
+}
+
+emit_ai_block <- function(assessment, dataset_label, trait, section) {
+  if (is.null(assessment) || !length(assessment$insights)) return(invisible(NULL))
+  selected <- Filter(function(item) {
+    identical(as.character(item$dataset_label), as.character(dataset_label)) &&
+      identical(as.character(item$trait), as.character(trait)) &&
+      identical(as.character(item$section), as.character(section))
+  }, assessment$insights)
+  if (!length(selected)) return(invisible(NULL))
+
+  cat("<div class='ai-insight'>")
+  cat("<div class='ai-insight-title'>AI-supported interpretation</div>")
+  cat("<p class='ai-disclaimer'>Generated from the displayed evidence; this is a cautious synthesis, not an additional association analysis.</p>")
+  for (item in selected) {
+    cat("<div class='ai-insight-item'>")
+    cat("<p>", htmlEscape(item$text %||% ""), "</p>", sep = "")
+    cat(
+      "<p class='ai-evidence'><strong>Evidence:</strong> ",
+      htmlEscape(paste(unlist(item$evidence_ids %||% list()), collapse = ", ")),
+      " &nbsp; <strong>Confidence:</strong> ",
+      htmlEscape(item$confidence %||% "not stated"), "</p>", sep = ""
+    )
+    limitations <- unlist(item$limitations %||% list())
+    if (length(limitations)) {
+      cat("<p class='ai-detail'><strong>Limitations:</strong> ",
+          htmlEscape(paste(limitations, collapse = "; ")), "</p>", sep = "")
+    }
+    follow_up <- item$follow_up %||% ""
+    if (nzchar(follow_up)) {
+      cat("<p class='ai-detail'><strong>Suggested follow-up:</strong> ",
+          htmlEscape(follow_up), "</p>", sep = "")
+    }
+    cat("</div>")
+  }
+  cat("</div>\n\n")
+  invisible(NULL)
+}
+
+# New format (schema_version 2.0): render loci-based assessment
+emit_ai_new_format <- function(assessment) {
+  s <- function(...) paste0(...)
+  safe_text <- function(x) {
+    x <- htmlEscape(as.character(x %||% ""))
+    gsub("\\{", "{{", gsub("\\}", "}}", x))
+  }
+  # Summary
+  if (!is.null(assessment$summary) && nzchar(assessment$summary %||% "")) {
+    cat(s('<div style="padding:12px 16px; background:#f4f8fb; border-left:4px solid #3c8dbc; border-radius:4px; margin-bottom:16px;">',
+          "<strong>Summary: </strong>", safe_text(assessment$summary), "</div>\n"))
+  }
+  # Key takeaway
+  if (!is.null(assessment$key_takeaway) && nzchar(assessment$key_takeaway %||% "")) {
+    cat(s('<div style="padding:10px 16px; background:#eafaf1; border-left:4px solid #27ae60; border-radius:4px; margin-bottom:16px;">',
+          "<strong>Key finding: </strong>", safe_text(assessment$key_takeaway), "</div>\n"))
+  }
+  # Loci
+  loci <- assessment$loci %||% list()
+  if (length(loci)) {
+    cat("<h5>Locus-by-locus summary</h5>\n")
+    for (locus in loci) {
+      novelty_color <- switch(locus$novelty %||% "Unknown",
+        "Novel" = "#27ae60", "Known" = "#e67e22", "#888")
+      cat(s(
+        '<div style="background:#fff; border:1px solid #e0e0e0; border-radius:6px; padding:12px 16px; margin-bottom:10px; border-left:4px solid #3498db;">',
+        "<strong>", safe_text(locus$lead_snp %||% ""), "</strong>",
+        ' &nbsp; <span style="color:#888; font-size:12px;">-log10P = ', safe_text(locus$log10p %||% ""), "</span><br>",
+        "Nearest gene: <strong>", safe_text(locus$nearest_gene %||% "N/A"), "</strong> &nbsp; ",
+        '<span style="font-weight:600; color:', novelty_color, ';">', safe_text(locus$novelty %||% "Unknown"), "</span><br>",
+        '<span style="font-size:12px; color:#555;">', safe_text(locus$novelty_detail %||% ""), "</span>"
+      ))
+      if (!is.null(locus$interpretation) && nzchar(locus$interpretation %||% "")) {
+        cat(s('<br><em style="color:#444;">', safe_text(locus$interpretation), "</em>"))
+      }
+      cat("</div>\n")
+    }
+  }
+  # Pathway / tissue
+  if (!is.null(assessment$pathway_enrichment) && nzchar(assessment$pathway_enrichment %||% "")) {
+    cat(s('<div style="padding:10px 16px; background:#f5eef8; border-left:4px solid #8e44ad; border-radius:4px; margin-top:12px;">',
+          "<strong>Pathway enrichment: </strong>", safe_text(assessment$pathway_enrichment), "</div>\n"))
+  }
+  if (!is.null(assessment$tissue_enrichment) && nzchar(assessment$tissue_enrichment %||% "")) {
+    cat(s('<div style="padding:10px 16px; background:#fef9e7; border-left:4px solid #f39c12; border-radius:4px; margin-top:8px;">',
+          "<strong>Tissue enrichment: </strong>", safe_text(assessment$tissue_enrichment), "</div>\n"))
+  }
+  invisible(NULL)
+}
+
+ai_assessment_for_trait <- function(snapshot, dataset_id, trait) {
+  if (is.null(snapshot$ai) || !isTRUE(snapshot$ai$included)) return(NULL)
+  assessments <- snapshot$ai$assessments %||% list()
+  assessments[[paste(dataset_id, trait, sep = "::")]]
+}
+
+emit_ai_trait_section <- function(assessment, dataset_label, trait) {
+  cat("\n### AI-supported insights\n\n")
+  if (is.null(assessment)) {
+    cat("<p class='text-muted'>No completed cached AI assessment is available for this trait.</p>\n\n")
+    return(invisible(NULL))
+  }
+  # New format (schema_version 2.0) uses $loci instead of $insights
+  schema_version <- assessment$schema_version %||% "1.0"
+  if (!is.null(assessment$loci) && length(assessment$loci) > 0) {
+    cat("<div class='ai-insight'>")
+    cat("<div class='ai-insight-title'>AI assessment completed</div>")
+    emit_ai_new_format(assessment)
+    cat("</div>\n\n")
+    return(invisible(NULL))
+  }
+  # Old format fallback ($insights)
+  items <- Filter(function(item) {
+    identical(as.character(item$dataset_label), as.character(dataset_label)) &&
+      !identical(as.character(item$section), "cross_dataset")
+  }, assessment$insights %||% list())
+  if (!length(items)) {
+    cat("<div class='ai-insight'><div class='ai-insight-title'>AI assessment completed</div>")
+    cat("<p>No dataset-specific interpretation passed evidence validation for this trait.</p></div>\n\n")
+    return(invisible(NULL))
+  }
+  for (section in unique(vapply(items, function(x) as.character(x$section), character(1)))) {
+    emit_ai_block(assessment, dataset_label, trait, section)
+  }
+  invisible(NULL)
+}
+
+overlap_for_trait <- function(trait) {
+  pieces <- lapply(snapshot$datasets, function(info) {
+    dt <- read_candidates(info$base_dir, trait, format_p = FALSE)
+    snp_col <- find_snp_col(dt)
+    if (!nrow(dt) || is.na(snp_col)) return(NULL)
+    p_col <- candidate_p_col(dt)
+    p <- if (!is.na(p_col)) suppressWarnings(as.numeric(dt[[p_col]])) else NA_real_
+    unique(data.table(
+      snp = as.character(dt[[snp_col]]), dataset = info$label,
+      neg_log10P = round(-log10(pmax(p, .Machine$double.xmin)), 3)
+    ))
+  })
+  pieces <- Filter(Negate(is.null), pieces)
+  if (!length(pieces)) return(data.table())
+  raw <- rbindlist(pieces, use.names = TRUE, fill = TRUE)
+  out <- raw[, .(
+    n_datasets = uniqueN(dataset),
+    datasets = paste(sort(unique(dataset)), collapse = ", "),
+    `-log10P values` = paste(sort(unique(neg_log10P[is.finite(neg_log10P)])), collapse = ", ")
+  ), by = snp]
+  setorder(out, -n_datasets, snp)
+  out
+}
+
+all_traits <- sort(unique(unlist(lapply(snapshot$datasets, function(x) list_traits(x$base_dir)))))
+traits <- if (identical(snapshot$trait_scope, "selected")) snapshot$selected_trait else all_traits
+traits <- traits[!is.na(traits) & nzchar(traits)]
+
+overlap_cache <- list()
+overlap_traits <- character()
+
+if ("overlap" %in% snapshot$sections && length(snapshot$datasets) >= 2) {
+  overlap_cache <- setNames(lapply(traits, overlap_for_trait), traits)
+  overlap_traits <- names(overlap_cache)[vapply(
+    overlap_cache,
+    function(x) nrow(x) > 0,
+    logical(1)
+  )]
+}
+```
+
+```{r, results='asis'}
+# ── Logo ──────────────────────────────────────────────────────────────────────
+# Try to find the logo relative to the snapshot or via GWASPHERE_BASE_DIR env
+logo_candidates <- c(
+  file.path(Sys.getenv("GWASPHERE_BASE_DIR", ""), "master", "www", "gwasphere_about.png"),
+  file.path(dirname(normalizePath(params$snapshot_path)), "..", "..", "master", "www", "gwasphere_about.png")
+)
+logo_path <- Filter(file.exists, logo_candidates)[1]
+
+if (!is.na(logo_path) && length(logo_path) > 0) {
+  img_b64 <- base64enc::base64encode(logo_path)
+  ext     <- tolower(tools::file_ext(logo_path))
+  mime    <- if (ext == "png") "image/png" else "image/jpeg"
+  cat(sprintf(
+    "<div style='margin-bottom:18px;'><img src='data:%s;base64,%s' alt='GWASphere' style='height:56px;width:auto;'/></div>\n",
+    mime, img_b64
+  ))
+}
+
+# ── Title ─────────────────────────────────────────────────────────────────────
+report_title <- snapshot$report_title
+if (is.null(report_title) || !nzchar(trimws(report_title))) {
+  report_title <- "GWAS Results Report"
+}
+cat("<h1 class='custom-report-title'>", htmlEscape(report_title), "</h1>\n", sep = "")
+```
+
+Report generated on `r snapshot$created_at` from `r length(snapshot$datasets)` loaded dataset(s).
+
+```{r, results='asis'}
+# ── Introductory text ─────────────────────────────────────────────────────────
+cat("
+<div style='background:#f8f9fa;border-left:4px solid #3498db;padding:14px 18px;margin:18px 0;border-radius:4px;font-size:0.97em;line-height:1.7;'>
+<p style='margin:0 0 8px 0;'>
+This report presents the results of a genome-wide association study (GWAS) and downstream
+post-GWAS analyses performed with <strong>GWASphere</strong> — a privacy-preserving,
+end-to-end analysis platform for HPC clusters.
+All analyses were run locally: no individual-level data or summary statistics were
+transferred to external servers.
+</p>
+<p style='margin:0;'>
+The report covers, for each analysed trait: genome-wide summary statistics,
+genomic risk loci, novelty assessment against the GWAS Catalog,
+functional annotation of candidate variants, gene-based and pathway enrichment analyses,
+and — where available — AI-assisted biological interpretation.
+A detailed description of the methods and parameters used is provided in the
+<strong>Methods</strong> section at the end of this report.
+</p>
+</div>
+")
+```
+
+```{r, results='asis'}
+# ── Summary table ─────────────────────────────────────────────────────────────
+summary_rows <- list()
+for (info in snapshot$datasets) {
+  p <- paths_for(info$base_dir)
+  loci_dt <- safe_fread(if (file.exists(p$loci_rsid)) p$loci_rsid else p$loci)
+  dataset_traits <- intersect(traits, list_traits(info$base_dir))
+  for (tr in dataset_traits) {
+    tr_loci <- if (nrow(loci_dt) && "trait" %in% names(loci_dt))
+      loci_dt[as.character(trait) == tr] else data.table()
+    n_loci  <- nrow(tr_loci)
+    n_leads <- if (n_loci && "leadSNPs" %in% names(tr_loci))
+      length(unique(unlist(strsplit(paste(tr_loci$leadSNPs, collapse=","), ",")))) else 0
+    nov_dt  <- safe_fread(file.path(p$gwas_catalog_dir, paste0(tr, "_novel.tsv")))
+    n_novel <- if (nrow(nov_dt) && "NOVEL" %in% names(nov_dt))
+      sum(nov_dt$NOVEL == TRUE | nov_dt$NOVEL == "TRUE", na.rm=TRUE) else NA
+    n_known <- if (nrow(nov_dt) && "NOVEL" %in% names(nov_dt))
+      sum(nov_dt$NOVEL == FALSE | nov_dt$NOVEL == "FALSE", na.rm=TRUE) else NA
+    cand_dt <- safe_fread(file.path(p$candidate_dir, paste0(tr, ".candidate_snps.tsv")))
+    summary_rows[[length(summary_rows)+1]] <- data.frame(
+      Dataset = info$label, Trait = tr,
+      `Loci` = n_loci, `Lead SNPs` = n_leads,
+      `Novel` = ifelse(is.na(n_novel), "—", n_novel),
+      `Known` = ifelse(is.na(n_known), "—", n_known),
+      `Candidate SNPs` = nrow(cand_dt),
+      check.names = FALSE
+    )
+  }
+}
+
+if (length(summary_rows)) {
+  sum_df <- do.call(rbind, summary_rows)
+  cat("<div style='margin:18px 0;'>
+")
+  cat("<h3 style='margin-bottom:8px;'>Results summary</h3>
+")
+  tbl_html <- knitr::kable(sum_df, format="html", row.names=FALSE,
+    table.attr="style='width:100%;border-collapse:collapse;font-size:0.93em;'")
+  tbl_html <- gsub("<th>", "<th style='background:#3498db;color:#fff;padding:7px 10px;text-align:left;'>", tbl_html)
+  tbl_html <- gsub("<td>", "<td style='padding:6px 10px;border-bottom:1px solid #dee2e6;'>", tbl_html)
+  cat(as.character(tbl_html), "
+</div>
+")
+}
+```
+
+```{r, results='asis'}
+cat("<nav class='custom-toc'><strong>Contents</strong>")
+for (info in snapshot$datasets) {
+  dataset_key <- slug(info$label)
+  dataset_id <- paste0("dataset-", dataset_key)
+  dataset_traits <- intersect(traits, list_traits(info$base_dir))
+
+  cat("<details><summary>Dataset: ", htmlEscape(info$label), "</summary><ul>", sep = "")
+  cat("<li><a href='#", dataset_id, "'>Overview</a></li>", sep = "")
+
+  for (trait in dataset_traits) {
+    trait_id <- paste0(dataset_id, "-trait-", slug(trait))
+    cat("<li><a href='#", trait_id, "'>", htmlEscape(trait), "</a></li>", sep = "")
+  }
+  cat("</ul></details>")
+}
+
+if ("trait_overlap" %in% snapshot$sections && length(traits) >= 2) {
+  cat("<details><summary>Cross-trait overlap</summary><ul>")
+  cat("<li><a href='#cross-trait-overlap'>Overview</a></li>")
+  cat("</ul></details>")
+}
+if ("overlap" %in% snapshot$sections) {
+  cat("<details><summary>Cross-dataset overlap</summary><ul>")
+  cat("<li><a href='#cross-dataset-overlap'>Overview</a></li>")
+  for (trait in overlap_traits) {
+    cat("<li><a href='#overlap-trait-", slug(trait), "'>", htmlEscape(trait), "</a></li>", sep = "")
+  }
+  cat("</ul></details>")
+}
+cat("<div style='margin-top:8px; border-top:1px solid #dee2e6; padding-top:8px;'>")
+cat("<a href='#methods' style='font-weight:600;'>Methods</a>")
+cat("</div>")
+cat("</nav>")
+```
+
+<style>
+#title-block-header { display:none; }
+.custom-report-title { margin-bottom:1rem; }
+.custom-toc { background:#fff; border-right:1px solid #dee2e6; padding:1rem 1.25rem; font-size:.92rem; line-height:1.35; z-index:1000; }
+.custom-toc > strong { display:block; font-size:1.1rem; margin-bottom:.75rem; }
+.custom-toc details { margin:.35rem 0; }
+.custom-toc summary { cursor:pointer; font-weight:600; padding:.3rem 0; }
+.custom-toc ul { margin:.25rem 0 .6rem .75rem; padding-left:1rem; }
+.custom-toc li { margin:.2rem 0; }
+.custom-toc a { text-decoration:none; }
+.ai-insight { margin:1rem 0 1.5rem; padding:1rem 1.2rem; border-left:4px solid #3c8dbc; background:#f4f8fb; border-radius:.35rem; }
+
+/* Table styling */
+.dataTables_wrapper,
+.dataTables_wrapper table {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
+  font-size: 13px !important;
+}
+table.dataTable thead th {
+  font-weight: 600 !important;
+  background-color: #f8f9fa !important;
+  border-bottom: 2px solid #dee2e6 !important;
+  padding: 6px 10px !important;
+  white-space: nowrap;
+}
+table.dataTable tbody td {
+  padding: 4px 10px !important;
+  line-height: 1.4 !important;
+  vertical-align: middle !important;
+}
+table.dataTable tbody tr:hover {
+  background-color: #f5f8ff !important;
+}
+.dataTables_wrapper .dataTables_length,
+.dataTables_wrapper .dataTables_filter,
+.dataTables_wrapper .dataTables_info,
+.dataTables_wrapper .dataTables_paginate {
+  font-size: 12px !important;
+}
+.ai-insight-title { font-weight:700; color:#24577a; margin-bottom:.4rem; }
+.ai-insight-item + .ai-insight-item { border-top:1px solid #d7e5ee; margin-top:.8rem; padding-top:.8rem; }
+.ai-disclaimer, .ai-evidence, .ai-detail { color:#5f6b75; font-size:.88rem; }
+.ai-evidence, .ai-detail { margin-bottom:.3rem; }
+@media (min-width:1200px) {
+  .custom-toc { position:fixed; top:40px; left:0; width:285px; max-height:calc(100vh - 60px); overflow-y:auto; }
+  body { padding-left:295px; padding-right:20px; max-width:100%; }
+  .quarto-container, .page-columns, #quarto-content { max-width:100% !important; padding-right:0 !important; }
+}
+@media (max-width:1199px) {
+  .custom-toc { position:relative; width:100%; border:1px solid #dee2e6; border-radius:.4rem; margin-bottom:1.5rem; }
+}
+</style>
+
+```{r, results='asis'}
+for (info in snapshot$datasets) {
+  dataset_key <- slug(info$label)
+  dataset_id <- paste0("dataset-", dataset_key)
+  cat("\n# Dataset: ", info$label, " {#", dataset_id, "}\n\n", sep = "")
+
+  if ("plots" %in% snapshot$sections) {
+    cat("\n## Combined Manhattan plot\n\n")
+    combined_mh <- copy_html_asset(
+      file.path(paths_for(info$base_dir)$mh_dir, "combined_mh.html"),
+      dataset_key, "combined"
+    )
+    emit_iframe(combined_mh, height = 520)
+  }
+
+  dataset_traits <- intersect(traits, list_traits(info$base_dir))
+  if (!length(dataset_traits)) {
+    cat("No matching traits were found for this dataset.\n\n")
+    next
+  }
+  for (trait in dataset_traits) {
+    trait_key <- slug(trait)
+    trait_id <- paste0(dataset_id, "-trait-", trait_key)
+    trait_ai <- ai_assessment_for_trait(snapshot, info$id, trait)
+    cat("\n## Trait: ", trait, " {#", trait_id, "}\n\n", sep = "")
+    if ("ai" %in% snapshot$sections) {
+      emit_ai_trait_section(trait_ai, info$label, trait)
+    }
+
+    if ("plots" %in% snapshot$sections) {
+      cat("\n### Association plots\n\n::: {.panel-tabset}\n\n#### Manhattan plot\n\n")
+      mh <- copy_html_asset(
+        file.path(paths_for(info$base_dir)$mh_dir, paste0(trait, "_mh.html")),
+        dataset_key, trait_key
+      )
+      emit_iframe(mh)
+
+      cat("\n#### QQ plot\n\n")
+      qq <- copy_qq_asset(find_qq(info$base_dir, trait), dataset_key, trait_key)
+      emit_image(qq)
+      cat("\n:::\n\n")
+
+      # Top hits from REGENIE tophits folder
+      tophits_dir <- paths_for(info$base_dir)$tophits_dir
+      if (!is.null(tophits_dir) && dir.exists(tophits_dir)) {
+        tophits_file <- list.files(tophits_dir,
+          pattern = paste0("^", trait, "\\.regenie\\.filtered\\.gz$"),
+          full.names = TRUE)
+        if (length(tophits_file) > 0) {
+          tophits_dt <- tryCatch(
+            data.table::fread(cmd = paste("zcat", shQuote(tophits_file[1])), sep = "\t"),
+            error = function(e) data.table()
+          )
+          if (nrow(tophits_dt) > 0) {
+            keep <- intersect(
+              c("RSID", "ID", "CHROM", "GENPOS", "ALLELE1", "ALLELE0",
+                "A1FREQ", "BETA", "SE", "LOG10P", "GENE_NAME", "GENE_DISTANCE"),
+              names(tophits_dt)
+            )
+            tophits_dt <- tophits_dt[, ..keep]
+            for (col in c("A1FREQ", "BETA", "SE", "LOG10P", "GENE_DISTANCE")) {
+              if (col %in% names(tophits_dt))
+                tophits_dt[[col]] <- round(suppressWarnings(as.numeric(tophits_dt[[col]])), 4)
+            }
+            if ("LOG10P" %in% names(tophits_dt)) data.table::setorder(tophits_dt, -LOG10P)
+            cat("\n### Top hits (REGENIE suggestive associations)\n\n")
+            cat("<p style=\'color:#555; font-size:14px;\'>Suggestive associations from REGENIE top hits ",
+                "(-log10P > 5, ~200 kb clumping). Pre-computed by REGENIE as an exploratory overview ",
+                "before genome-wide significant loci are defined by the downstream pipeline.</p>\n\n")
+            tophits_path <- save_table_asset(
+              tophits_dt,
+              relative_asset(dataset_key, trait_key, "tophits.html")
+            )
+            emit_iframe(tophits_path, height = 400)
+          }
+        }
+      }
+    }
+
+    if ("candidates" %in% snapshot$sections) {
+      cat("\n### Candidate SNPs\n\n")
+      cat("<p style='color:#555; font-size:14px;'>All variants in LD (r\u00b2 \u2265 0.6) with an independent significant SNP ",
+          "and showing nominal association (P < PTAG). These include the index SNPs themselves (r\u00b2 = 1) ",
+          "and their proxies. Useful for fine-mapping and functional annotation of associated regions.</p>\n\n")
+      table_path <- save_table_asset(
+        read_candidates(info$base_dir, trait),
+        relative_asset(dataset_key, trait_key, "candidate_snps.html")
+      )
+      emit_iframe(table_path, height = 450)
+    }
+
+    if ("loci" %in% snapshot$sections) {
+      loci_dt <- read_trait_loci(info$base_dir, trait)
+      cat("\n### Genomic risk loci\n\n")
+      cat("<p style='color:#555; font-size:14px;'>Genomic risk loci defined by LD clumping. ",
+          "Each locus groups one or more independent significant SNPs within a merged LD-based region.</p>\n\n")
+      loci_path <- save_table_asset(
+        loci_dt,
+        relative_asset(dataset_key, trait_key, "loci.html")
+      )
+      emit_iframe(loci_path, height = 400)
+
+      if (nrow(loci_dt) && "leadRSIDs" %in% names(loci_dt)) {
+        leads <- unique(trimws(unlist(strsplit(as.character(loci_dt$leadRSIDs), ","))))
+        leads <- leads[nzchar(leads) & !is.na(leads)]
+
+        if (length(leads)) {
+          cat("\n### LocusZoom plots\n\n")
+          cat("::: {.panel-tabset}\n\n")
+          for (lead in leads) {
+            cat("\n#### ", lead, "\n\n", sep = "")
+            lz_source <- find_locuszoom(info$base_dir, trait, lead)
+            lz_path <- copy_locuszoom_asset(
+              lz_source, dataset_key, trait_key, slug(lead)
+            )
+            emit_iframe(lz_path, height = 520)
+          }
+          cat("\n:::\n\n")
+        }
+      }
+    }
+
+    optional_sections <- c(
+      "novelty", "pubmed", "snpeff",
+      "magma_genes", "magma_genesets", "magma_tissues"
+    )
+    if (any(optional_sections %in% snapshot$sections)) {
+      extra <- read_optional_sections(info$base_dir, trait)
+    }
+
+    if ("novelty" %in% snapshot$sections) {
+      cat("\n### Novelty / GWAS Catalog\n\n")
+      novelty_method <- get_novelty_method(info$base_dir, trait)
+      cat("<p style='color:#555; font-size:14px;'>Lead SNPs assessed against the GWAS Catalog (same-trait subset). ",
+          "Matching used: ", novelty_method, ". ",
+          "The <strong>NOVEL</strong> column indicates whether the association is novel: ",
+          "<strong>TRUE</strong> = no known association within 500 kb for this trait in the GWAS Catalog; ",
+          "<strong>FALSE</strong> = already reported in the GWAS Catalog for this trait.</p>\n\n")
+      cat("\n#### Trait-specific novelty\n\n")
+      novelty_path <- save_table_asset(
+        extra$novelty,
+        relative_asset(dataset_key, trait_key, "novelty.html")
+      )
+      emit_iframe(novelty_path, height = 400)
+
+      cat("\n#### Associations with other traits in the locus window\n\n")
+      cat("<p style='color:#555; font-size:14px;'>GWAS Catalog associations from other traits found within 500 kb of each lead SNP. ",
+          "Useful for identifying pleiotropic effects and cross-trait genetic overlap.</p>\n\n")
+      other_traits_path <- save_table_asset(
+        extra$other_traits,
+        relative_asset(dataset_key, trait_key, "other_traits.html")
+      )
+      emit_iframe(other_traits_path, height = 400)
+    }
+
+    if ("pubmed" %in% snapshot$sections) {
+      cat("\n### PubMed evidence\n\n")
+      cat("<p style='color:#555; font-size:14px;'>PubMed literature search for the nearest gene of each lead SNP, ",
+          "using different strategies depending on novelty status:</p>",
+          "<ul style='color:#555; font-size:14px;'>",
+          "<li><strong>Known SNPs (NOVEL = FALSE):</strong> searched as (gene) AND (trait), ",
+          "and (gene) AND (trait) AND (rsID) if available.</li>",
+          "<li><strong>Novel SNPs (NOVEL = TRUE):</strong> searched as (gene) AND (function), ",
+          "(gene) AND (expression), (gene) AND (pathway), (gene) AND (human phenotype) ",
+          "— to find functional evidence for the gene.</li>",
+          "<li>All searches require an abstract (hasabstract filter), sorted by relevance.</li>",
+          "</ul>\n\n")
+      # PubMed table: truncate abstract to 200 chars with tooltip for full text
+      pubmed_dt <- extra$pubmed
+      if (nrow(pubmed_dt) > 0) {
+        pubmed_dt <- as.data.frame(copy(pubmed_dt), stringsAsFactors = FALSE)
+        if ("abstract" %in% names(pubmed_dt)) {
+          pubmed_dt$abstract_full <- pubmed_dt$abstract
+          pubmed_dt$abstract <- ifelse(
+            nchar(pubmed_dt$abstract) > 200,
+            paste0(substr(pubmed_dt$abstract, 1, 200), "..."),
+            pubmed_dt$abstract
+          )
+          # Remove full abstract column
+          pubmed_dt$abstract_full <- NULL
+        }
+        abs_idx <- which(tolower(names(pubmed_dt)) == "abstract") - 1L
+        pubmed_widget <- DT::datatable(
+          pubmed_dt,
+          rownames = FALSE,
+          filter = "top",
+          options = list(
+            pageLength = 20,
+            scrollX = TRUE,
+            columnDefs = if (length(abs_idx)) list(list(width = "280px", targets = abs_idx)) else list()
+          )
+        )
+        pubmed_rel <- relative_asset(dataset_key, trait_key, "pubmed.html")
+        pubmed_abs <- file.path(report_root, pubmed_rel)
+        dir.create(dirname(pubmed_abs), recursive = TRUE, showWarnings = FALSE)
+        htmlwidgets::saveWidget(pubmed_widget, pubmed_abs,
+                                selfcontained = FALSE, title = "PubMed")
+        emit_iframe(pubmed_rel, height = 500)
+      } else {
+        cat("<p class='text-muted'>No PubMed results available for this trait.</p>\n\n")
+      }
+    }
+
+    if ("snpeff" %in% snapshot$sections) {
+      cat("\n### SnpEff annotation\n\n")
+      cat("<p style='color:#555; font-size:14px;'>Functional annotation of candidate SNPs using SnpEff. ",
+          "Shows the proportion of variants in each functional category (e.g. missense, synonymous, intergenic). ",
+          "Helps prioritise potentially functional variants for follow-up.</p>\n\n")
+      prop_dt <- read_snpeff_proportions(info$base_dir, trait)
+      if (nrow(prop_dt) && all(c("annotation", "proportion") %in% names(prop_dt))) {
+        prop_dt[, proportion := suppressWarnings(as.numeric(proportion))]
+        prop_dt <- prop_dt[is.finite(proportion)]
+        if (nrow(prop_dt)) {
+          prop_dt[, annotation := factor(
+            as.character(annotation),
+            levels = as.character(annotation[order(proportion)])
+          )]
+          snpeff_plot <- ggplot(prop_dt, aes(annotation, proportion)) +
+            geom_col(fill = "#966B9D") +
+            coord_flip() +
+            labs(x = NULL, y = "Proportion", title = paste("SnpEff annotation proportions -", trait)) +
+            theme_minimal(base_size = 11) +
+            theme(panel.grid.minor = element_blank())
+          print(snpeff_plot)
+        }
+      }
+    }
+
+    if ("magma_genes" %in% snapshot$sections) {
+      cat("\n\n### MAGMA gene analysis\n\n")
+      cat("<p style='color:#555; font-size:14px;'>Gene-based association analysis aggregating SNP-level p-values within gene boundaries. ",
+          "Gene-set analysis tests enrichment in biological pathways (MSigDB). ",
+          "Tissue analysis identifies relevant tissues using GTEx v8 expression data.</p>\n\n")
+      # Gene-based Manhattan plot
+      gene_mh_file <- file.path(paths_for(info$base_dir)$gene_mh_dir,
+                                paste0(trait, "_gene_mh.html"))
+      if (file.exists(gene_mh_file)) {
+        gene_mh_rel <- relative_asset(dataset_key, trait_key, "gene_manhattan",
+                                      paste0(trait, "_gene_mh.html"))
+        gene_mh_abs <- file.path(report_root, gene_mh_rel)
+        dir.create(dirname(gene_mh_abs), recursive = TRUE, showWarnings = FALSE)
+        dep_dir <- paste0(tools::file_path_sans_ext(gene_mh_file), "_files")
+        file.copy(gene_mh_file, gene_mh_abs, overwrite = TRUE)
+        if (dir.exists(dep_dir)) file.copy(dep_dir, dirname(gene_mh_abs), recursive = TRUE, overwrite = TRUE)
+        emit_iframe(gene_mh_rel, height = 500)
+      } else {
+        cat("<p style='color:#888; font-size:13px;'>Gene-based Manhattan plot not available for this trait.</p>\n\n")
+      }
+      magma_plot <- make_magma_plot(
+        extra$magma_genes, c("SYMBOL", "GENE", "ENTREZID"),
+        paste("Top MAGMA genes -", trait)
+      )
+      if (!is.null(magma_plot)) print(magma_plot)
+      mg_genes_tbl <- add_log10p_and_sort(extra$magma_genes)
+      # Remove raw GENE column (SYMBOL already shown)
+      drop_cols <- intersect(c("GENE"), names(mg_genes_tbl))
+      if (length(drop_cols)) mg_genes_tbl[, (drop_cols) := NULL]
+      magma_path <- save_table_asset(
+        mg_genes_tbl,
+        relative_asset(dataset_key, trait_key, "magma_genes.html")
+      )
+      emit_iframe(magma_path, height = 650)
+    }
+
+    if ("magma_genesets" %in% snapshot$sections) {
+      cat("\n\n### MAGMA gene-set analysis\n\n")
+      geneset_plot <- make_magma_plot(
+        extra$magma_genesets,
+        c("VARIABLE", "FULL_NAME", "GENESET", "SET", "NAME"),
+        paste("Top MAGMA gene sets -", trait)
+      )
+      if (!is.null(geneset_plot)) print(geneset_plot)
+      geneset_path <- save_table_asset(
+        add_log10p_and_sort(extra$magma_genesets),
+        relative_asset(dataset_key, trait_key, "magma_gene_sets.html")
+      )
+      emit_iframe(geneset_path, height = 650)
+    }
+
+    if ("magma_tissues" %in% snapshot$sections) {
+      cat("\n\n### MAGMA tissue analysis\n\n")
+      tissue_plot <- make_magma_plot(
+        extra$magma_tissues,
+        c("VARIABLE", "TISSUE", "TISSUE_NAME", "NAME"),
+        paste("MAGMA tissue enrichment -", trait)
+      )
+      if (!is.null(tissue_plot)) print(tissue_plot)
+      tissue_path <- save_table_asset(
+        add_log10p_and_sort(extra$magma_tissues),
+        relative_asset(dataset_key, trait_key, "magma_tissues.html")
+      )
+      emit_iframe(tissue_path, height = 650)
+    }
+  }
+}
+```
+
+```{r, results='asis'}
+# AI assessments are per dataset; cross-dataset SNP overlap remains a separate report section.
+```
+
+```{r, results='asis'}
+# ── Cross-trait candidate SNP overlap (within same dataset) ──────────────────
+if ("trait_overlap" %in% snapshot$sections && length(traits) >= 2) {
+  cat("\n# Cross-trait candidate SNP overlap {#cross-trait-overlap}\n\n")
+  cat("<p style='color:#555; font-size:14px;'>Candidate SNPs shared across multiple traits within the same dataset. ",
+      "Variants appearing in more than one trait may indicate pleiotropic effects.</p>\n\n")
+
+  for (info in snapshot$datasets) {
+    p <- paths_for(info$base_dir)
+    dataset_traits <- intersect(traits, list_traits(info$base_dir))
+    if (length(dataset_traits) < 2) next
+
+    cat("\n## Dataset: ", htmlEscape(info$label), "\n\n", sep="")
+
+    pieces <- lapply(dataset_traits, function(tr) {
+      dt <- safe_fread(file.path(p$candidate_dir, paste0(tr, ".candidate_snps.tsv")))
+      if (!nrow(dt)) return(NULL)
+      snp_col <- names(dt)[toupper(gsub("[^A-Za-z0-9]+","",names(dt))) %in%
+        toupper(gsub("[^A-Za-z0-9]+","",c("candidateSNP","rsID","SNP","ID")))][1]
+      if (is.na(snp_col)) return(NULL)
+      data.table(snp = as.character(dt[[snp_col]]), trait = tr)
+    })
+    pieces <- Filter(Negate(is.null), pieces)
+    if (length(pieces) < 2) next
+
+    all_snps <- rbindlist(pieces)
+    overlap <- all_snps[, .(
+      n_traits = uniqueN(trait),
+      traits   = paste(sort(unique(trait)), collapse=", ")
+    ), by = snp][n_traits >= 2][order(-n_traits, snp)]
+
+    if (nrow(overlap) == 0) {
+      cat("<p style='color:#888;'>No candidate SNPs shared between traits.</p>\n\n")
+      next
+    }
+
+    cat(sprintf("<p style='font-size:13px; color:#555;'>%d candidate SNP(s) shared between %d or more traits.</p>\n\n",
+      nrow(overlap), 2L))
+
+    overlap_path <- save_table_asset(
+      overlap,
+      relative_asset("cross_trait", slug(info$label), "overlap.html")
+    )
+    emit_iframe(overlap_path, height = 400)
+  }
+}
+```
+
+```{r, results='asis', fig.width=7, fig.height=3.5, out.width='70%'}
+if ("overlap" %in% snapshot$sections) {
+  cat("\n# Cross-dataset candidate SNP overlap {#cross-dataset-overlap}\n\n")
+  if (length(snapshot$datasets) < 2) {
+    cat("At least two loaded datasets are required for this section.\n\n")
+  } else {
+    for (trait in overlap_traits) {
+      overlap <- overlap_cache[[trait]]
+      trait_ai <- NULL  # No combined AI assessment; use the dedicated overlap analysis.
+      cat("\n## Trait: ", trait, " {#overlap-trait-", slug(trait), "}\n\n", sep = "")
+      counts <- overlap[, .N, by = n_datasets][order(n_datasets)]
+      p <- ggplot(counts, aes(factor(n_datasets), N)) +
+        geom_col(fill = "#3c8dbc") +
+        geom_text(aes(label = N), vjust = -0.35) +
+        scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+        coord_cartesian(clip = "off") +
+        labs(x = "Number of datasets in which the SNP appears",
+             y = "Number of candidate SNPs") +
+        theme_minimal(base_size = 12) +
+        theme(
+          panel.grid.minor = element_blank(),
+          plot.margin = margin(t = 15, r = 10, b = 10, l = 10)
+        )
+      print(p)
+
+      overlap_path <- save_table_asset(
+        overlap,
+        relative_asset("overlap", paste0(slug(trait), "_overlap.html"))
+      )
+      emit_iframe(overlap_path, height = 650)
+    }
+  }
+}
+```
+
+```{r, results='asis'}
+# Methods: parameters are reported independently for every included dataset.
+cat("\n# Methods {#methods}\n\n")
+cat("This report was generated with **GWASphere**, a privacy-preserving, end-to-end")
+cat(" post-GWAS analysis platform for HPC clusters. All analyses were performed locally;")
+cat(" no individual-level data or summary statistics were transferred to external servers.\n\n")
+
+method_value <- function(value) {
+  if (is.null(value) || !length(value)) return("Not recorded")
+  value <- as.character(value[[1]])
+  if (is.na(value) || !nzchar(trimws(value))) "Not recorded" else value
+}
+
+# Escape table delimiters to keep the Markdown table valid.
+method_cell <- function(value) {
+  gsub("|", "\\|", method_value(value), fixed = TRUE)
+}
+
+for (i in seq_along(snapshot$datasets)) {
+  info <- snapshot$datasets[[i]]
+  run_p <- read_run_params(info$base_dir)
+  dataset_name <- method_value(info$label)
+  if (identical(dataset_name, "Not recorded")) dataset_name <- paste("Dataset", i)
+  cl <- if (is.null(run_p)) list() else run_p$clumping %||% list()
+  nv <- if (is.null(run_p)) list() else run_p$novelty %||% list()
+  mg <- if (is.null(run_p)) list() else run_p$magma %||% list()
+
+  cat("## Dataset: ", dataset_name, "\n\n", sep = "")
+  if (is.null(run_p)) {
+    cat("*Run parameters not available (`run_params.json` not found or unreadable).*\n\n")
+  }
+  entries <- list(
+    "Run date" = if (is.null(run_p)) NULL else run_p$run_date,
+    "Index SNP threshold (P1)" = cl$P1,
+    "Candidate SNP threshold (PTAG)" = cl$PTAG,
+    "Step 1 r² (independent significant SNPs)" = cl$STEP1_R2,
+    "Step 2 r² (lead SNP selection)" = cl$STEP2_R2,
+    "Locus merge distance (kb)" = cl$MERGE_KB,
+    "MAF filter" = cl$MAF,
+    "GWAS Catalog trait matching (default string)" = nv$default_trait_string,
+    "GWAS Catalog trait map" = if (is.null(nv$trait_map_xlsx)) NULL else basename(nv$trait_map_xlsx),
+    "MAGMA gene sets" = if (is.null(mg$geneset)) NULL else basename(mg$geneset),
+    "MAGMA tissue expression reference" = if (is.null(mg$gtex)) NULL else basename(mg$gtex)
+  )
+  cat("| Parameter | Value |\n|---|---|\n")
+  for (key in names(entries)) {
+    cat("| ", method_cell(key), " | ", method_cell(entries[[key]]), " |\n", sep = "")
+  }
+  cat("\n")
+}
+
+cat("## Analytical Pipeline\n\n")
+cat("### LD clumping and locus definition\n\n")
+cat("Genomic risk loci were identified using a FUMA-inspired LD clumping pipeline")
+cat(" implemented in PLINK (Watanabe et al., *Nat Commun* 2017).")
+cat(" Dataset-specific thresholds, LD parameters, merge distances and MAF filters")
+cat(" are listed above.\n\n")
+
+cat("### Candidate SNPs\n\n")
+cat("Variants in LD with an independent significant SNP and showing nominal association")
+cat(" were defined as candidate SNPs. Independent significant SNPs are included")
+cat(" as candidates with r² = 1. Dataset-specific thresholds are listed above.\n\n")
+
+cat("### Novelty assessment\n\n")
+cat("Lead SNPs were assessed for novelty by querying the GWAS Catalog")
+cat(" (Buniello et al., *Nucleic Acids Res* 2019) using GWASLab")
+cat(" (He et al., *J Hum Genet* 2023).")
+cat(" A locus was classified as **Novel** if no known association was present")
+cat(" within **500 kb** in the same-trait subset of the GWAS Catalog (P ≤ 5×10⁻⁸),")
+cat(" matched by EFO identifier where available, otherwise by trait string.")
+cat(" Dataset-specific trait matching settings are listed above.\n\n")
+
+cat("### PubMed literature search\n\n")
+cat("PubMed was queried for the nearest gene of each lead SNP.")
+cat(" For **known** loci, searches combined the gene name with the trait.")
+cat(" For **novel** loci, functional terms (expression, pathway, human phenotype) were used")
+cat(" to retrieve supporting literature independent of the GWAS Catalog.\n\n")
+
+cat("### Functional annotation (SNpeff)\n\n")
+cat("Candidate SNPs were annotated with predicted functional consequences using")
+cat(" **SNpeff** (Cingolani et al., *Fly* 2012).")
+cat(" Annotation proportions across variant categories are summarised per trait.\n\n")
+
+cat("### LocusZoom regional plots\n\n")
+cat("Regional association plots were generated for each independent significant SNP")
+cat(" using a 500 kb window, with LD coloring based on the study reference panel.\n\n")
+
+cat("### MAGMA gene, gene-set and tissue analysis\n\n")
+cat("Gene-based association analysis was performed using **MAGMA** v1.10")
+cat(" (de Leeuw et al., *PLOS Comput Biol* 2015).")
+cat(" SNP-level p-values were aggregated within gene boundaries (window: 35 kb upstream,")
+cat(" 10 kb downstream) using a SNP-wise mean model.")
+cat(" Gene-set enrichment was tested against **MSigDB** gene sets.")
+cat(" Tissue expression enrichment used **GTEx v8** data.")
+cat(" Dataset-specific reference files are listed above.\n\n")
+
+cat("### AI-assisted interpretation\n\n")
+cat("When requested and available, on-demand AI reports were generated using a locally")
+cat(" deployed large language model via **Ollama** (no data sent externally).")
+cat(" The model synthesises evidence from pipeline steps to produce a structured")
+cat(" summary prioritised by strength of evidence (GWAS Catalog support, PubMed hits,")
+cat(" MAGMA gene convergence). Outputs are clearly labelled as AI-generated and should")
+cat(" be interpreted as hypothesis-generating rather than conclusive.\n\n")
+```
