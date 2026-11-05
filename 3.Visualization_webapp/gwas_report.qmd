@@ -924,18 +924,41 @@ for (info in snapshot$datasets) {
 
     if ("novelty" %in% snapshot$sections) {
       cat("\n### Novelty / GWAS Catalog\n\n")
-      novelty_method <- get_novelty_method(info$base_dir, trait)
-      cat("<p style='color:#555; font-size:14px;'>Lead SNPs assessed against the GWAS Catalog (same-trait subset). ",
-          "Matching used: ", novelty_method, ". ",
-          "The <strong>NOVEL</strong> column indicates whether the association is novel: ",
-          "<strong>TRUE</strong> = no known association within 500 kb for this trait in the GWAS Catalog; ",
-          "<strong>FALSE</strong> = already reported in the GWAS Catalog for this trait.</p>\n\n")
-      cat("\n#### Trait-specific novelty\n\n")
-      novelty_path <- save_table_asset(
-        extra$novelty,
-        relative_asset(dataset_key, trait_key, "novelty.html")
-      )
-      emit_iframe(novelty_path, height = 400)
+
+      # Check if novelty classification was actually performed
+      rp_path <- file.path(info$base_dir, "run_params.json")
+      novelty_performed <- TRUE
+      if (file.exists(rp_path)) {
+        tryCatch({
+          rp <- jsonlite::fromJSON(rp_path)
+          def_str   <- if (is.null(rp$novelty$default_trait_string)) "" else rp$novelty$default_trait_string
+          trait_map <- if (is.null(rp$novelty$trait_map_xlsx)) "" else rp$novelty$trait_map_xlsx
+          if (!nzchar(def_str) && (!nzchar(trait_map) || trait_map == "path/to/file/" || !file.exists(trait_map))) {
+            novelty_performed <- FALSE
+          }
+        }, error = function(e) NULL)
+      }
+
+      if (!novelty_performed) {
+        cat("<div style='background:#fff3cd; border:1px solid #ffc107; border-radius:6px; padding:12px 16px; font-size:14px; color:#856404; margin-bottom:16px;'>",
+            "<strong>&#9888; Novelty classification was not performed.</strong> ",
+            "No trait string or EFO mapping was provided. ",
+            "Cross-trait GWAS Catalog associations within 500 kb of each lead SNP are shown below.",
+            "</div>\n\n")
+      } else {
+        novelty_method <- get_novelty_method(info$base_dir, trait)
+        cat("<p style='color:#555; font-size:14px;'>Lead SNPs assessed against the GWAS Catalog (same-trait subset). ",
+            "Matching used: ", novelty_method, ". ",
+            "The <strong>NOVEL</strong> column indicates whether the association is novel: ",
+            "<strong>TRUE</strong> = no known association within 500 kb for this trait in the GWAS Catalog; ",
+            "<strong>FALSE</strong> = already reported in the GWAS Catalog for this trait.</p>\n\n")
+        cat("\n#### Trait-specific novelty\n\n")
+        novelty_path <- save_table_asset(
+          extra$novelty,
+          relative_asset(dataset_key, trait_key, "novelty.html")
+        )
+        emit_iframe(novelty_path, height = 400)
+      }
 
       cat("\n#### Associations with other traits in the locus window\n\n")
       cat("<p style='color:#555; font-size:14px;'>GWAS Catalog associations from other traits found within 500 kb of each lead SNP. ",
@@ -949,15 +972,29 @@ for (info in snapshot$datasets) {
 
     if ("pubmed" %in% snapshot$sections) {
       cat("\n### PubMed evidence\n\n")
-      cat("<p style='color:#555; font-size:14px;'>PubMed literature search for the nearest gene of each lead SNP, ",
-          "using different strategies depending on novelty status:</p>",
-          "<ul style='color:#555; font-size:14px;'>",
-          "<li><strong>Known SNPs (NOVEL = FALSE):</strong> searched as (gene) AND (trait), ",
-          "and (gene) AND (trait) AND (rsID) if available.</li>",
-          "<li><strong>Novel SNPs (NOVEL = TRUE):</strong> searched as (gene) AND (function), ",
-          "(gene) AND (expression), (gene) AND (pathway), (gene) AND (human phenotype) ",
-          "— to find functional evidence for the gene.</li>",
-          "<li>All searches require an abstract (hasabstract filter), sorted by relevance.</li>",
+      # PubMed description depends on whether novelty was performed
+      rp_path2 <- file.path(info$base_dir, "run_params.json")
+      novelty_performed2 <- TRUE
+      if (file.exists(rp_path2)) {
+        tryCatch({
+          rp2 <- jsonlite::fromJSON(rp_path2)
+          def_str2   <- if (is.null(rp2$novelty$default_trait_string)) "" else rp2$novelty$default_trait_string
+          trait_map2 <- if (is.null(rp2$novelty$trait_map_xlsx)) "" else rp2$novelty$trait_map_xlsx
+          if (!nzchar(def_str2) && (!nzchar(trait_map2) || trait_map2 == "path/to/file/" || !file.exists(trait_map2))) {
+            novelty_performed2 <- FALSE
+          }
+        }, error = function(e) NULL)
+      }
+      if (novelty_performed2) {
+        cat("<p style='color:#555; font-size:14px;'>PubMed literature search for the nearest gene of each lead SNP, ",
+            "using different strategies depending on novelty status:</p>",
+            "<ul style='color:#555; font-size:14px;'>",
+            "<li><strong>Known SNPs (NOVEL = FALSE):</strong> searched as (gene) AND (trait), ",
+            "and (gene) AND (trait) AND (rsID) if available.</li>",
+            "<li><strong>Novel SNPs (NOVEL = TRUE):</strong> searched as (gene) AND (function), ",
+            "(gene) AND (expression), (gene) AND (pathway), (gene) AND (human phenotype) ",
+            "— to find functional evidence for the gene.</li>",
+            "<li>All searches require an abstract (hasabstract filter), sorted by relevance.</li>",
           "</ul>\n\n")
       # PubMed table: truncate abstract to 200 chars with tooltip for full text
       pubmed_dt <- extra$pubmed
@@ -992,6 +1029,31 @@ for (info in snapshot$datasets) {
         emit_iframe(pubmed_rel, height = 500)
       } else {
         cat("<p class='text-muted'>No PubMed results available for this trait.</p>\n\n")
+      }
+      } else {
+        # novelty not performed — generic description
+        cat("<p style='color:#555; font-size:14px;'>PubMed literature search for the nearest gene of each lead SNP, ",
+            "using a generic functional search strategy (expression, pathway, human phenotype).</p>\n\n")
+        pubmed_dt <- extra$pubmed
+        if (nrow(pubmed_dt) > 0) {
+          pubmed_dt <- as.data.frame(copy(pubmed_dt), stringsAsFactors = FALSE)
+          if ("abstract" %in% names(pubmed_dt)) {
+            pubmed_dt$abstract <- ifelse(
+              nchar(pubmed_dt$abstract) > 200,
+              paste0(substr(pubmed_dt$abstract, 1, 200), "..."),
+              pubmed_dt$abstract
+            )
+          }
+          pubmed_rel <- relative_asset(dataset_key, trait_key, "pubmed.html")
+          pubmed_abs <- file.path(report_root, pubmed_rel)
+          dir.create(dirname(pubmed_abs), recursive = TRUE, showWarnings = FALSE)
+          pubmed_widget <- DT::datatable(pubmed_dt, rownames = FALSE, filter = "top",
+            options = list(pageLength = 20, scrollX = TRUE))
+          htmlwidgets::saveWidget(pubmed_widget, pubmed_abs, selfcontained = FALSE, title = "PubMed")
+          emit_iframe(pubmed_rel, height = 500)
+        } else {
+          cat("<p class='text-muted'>No PubMed results available for this trait.</p>\n\n")
+        }
       }
     }
 
@@ -1254,9 +1316,9 @@ cat(" For **known** loci, searches combined the gene name with the trait.")
 cat(" For **novel** loci, functional terms (expression, pathway, human phenotype) were used")
 cat(" to retrieve supporting literature independent of the GWAS Catalog.\n\n")
 
-cat("### Functional annotation (SNpeff)\n\n")
+cat("### Functional annotation (SnpEff)\n\n")
 cat("Candidate SNPs were annotated with predicted functional consequences using")
-cat(" **SNpeff** (Cingolani et al., *Fly* 2012).")
+cat(" **SnpEff** (Cingolani et al., *Fly* 2012).")
 cat(" Annotation proportions across variant categories are summarised per trait.\n\n")
 
 cat("### LocusZoom regional plots\n\n")

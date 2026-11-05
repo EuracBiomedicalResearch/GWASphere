@@ -141,10 +141,25 @@ ai_read_sections <- function(info, trait) {
   if (nrow(pubmed) && "abstract" %in% names(pubmed)) {
     pubmed[, abstract := substr(as.character(abstract), 1L, 800L)]
   }
+  # Check if novelty classification was performed
+  run_params_path <- file.path(info$base_dir, "run_params.json")
+  novelty_check_performed <- TRUE
+  if (file.exists(run_params_path)) {
+    tryCatch({
+      rp <- jsonlite::fromJSON(run_params_path)
+      def_str   <- if (is.null(rp$novelty$default_trait_string)) "" else rp$novelty$default_trait_string
+      trait_map <- if (is.null(rp$novelty$trait_map_xlsx)) "" else rp$novelty$trait_map_xlsx
+      if (!nzchar(def_str) && (!nzchar(trait_map) || trait_map == "path/to/file/" || !file.exists(trait_map))) {
+        novelty_check_performed <- FALSE
+      }
+    }, error = function(e) NULL)
+  }
+
   list(
     dataset_id = stable_dataset_id,
     dataset_label = info$label,
     trait = trait,
+    novelty_check_performed = novelty_check_performed,
     loci = ai_records(loci, paste0(dataset_prefix, "_LOCUS"), 30L, "minP"),
     candidates = ai_records(candidates, paste0(dataset_prefix, "_CAND"), 60L, ai_candidate_p_col(candidates)),
     novelty = ai_records(

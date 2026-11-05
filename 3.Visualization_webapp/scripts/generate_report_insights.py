@@ -92,6 +92,7 @@ def make_prompt(evidence: dict[str, Any]) -> str:
     loci_summary = []
     for ds in datasets:
         label = ds.get("dataset_label", "")
+        novelty_check_performed = ds.get("novelty_check_performed", True)
         # Build loci summary directly from novelty rows — each row is a lead SNP
         # with GENE_NAME, NOVEL, KNOWN_* already populated by novel_detection.py
         for nov in ds.get("novelty", [])[:10]:
@@ -106,7 +107,10 @@ def make_prompt(evidence: dict[str, Any]) -> str:
                 is_novel = nov.get("NOVEL", None)
 
                 # Novel status
-                if is_novel is True or str(is_novel).lower() in ("true", "1"):
+                if not novelty_check_performed:
+                    novel_str    = "Not assessed"
+                    known_detail = "Novelty classification was not performed (no trait string or EFO mapping provided). Cross-trait GWAS Catalog associations were assessed."
+                elif is_novel is True or str(is_novel).lower() in ("true", "1"):
                     novel_str    = "Novel"
                     known_detail = "Novel: no association reported within 500 kb for this trait in the GWAS Catalog"
                 elif is_novel is False or str(is_novel).lower() in ("false", "0"):
@@ -235,6 +239,7 @@ If a field is empty or missing, omit it rather than speculating.
 
 CONTEXT:
 - Total loci: {n_loci} ({n_known} known, {n_novel} novel)
+- Novelty classification: {"NOT PERFORMED — no trait string or EFO mapping was provided. Do not mention novel/known status. Cross-trait GWAS Catalog comparison was performed." if any(l["novel"] == "Not assessed" for l in loci_summary) else "performed"}
 - Loci with PubMed support for the nearest gene: {n_with_pubmed}
 - Loci whose nearest gene is also a top MAGMA gene (convergent evidence): {n_overlap}
 - Significant MAGMA gene-sets (P < 0.05): {n_sig_genesets}
@@ -243,8 +248,9 @@ CONTEXT:
 YOUR TASK — follow these rules strictly:
 
 SUMMARY (2-3 sentences):
-- State how many loci were found, how many are novel vs known
-- If most loci are novel and lack PubMed support, say so explicitly — do not speculate about their function
+- State how many loci were found
+- If novelty classification was performed: state how many are novel vs known. If most loci are novel and lack PubMed support, say so explicitly — do not speculate about their function
+- If novelty classification was NOT performed: do NOT mention novel/known status. Instead note that cross-trait GWAS Catalog associations were assessed for each locus
 - Highlight only loci where pubmed_hits is non-empty as having biological support
 
 LOCI (prioritize as follows, in this order):
