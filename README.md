@@ -99,9 +99,9 @@ Open `master/run.sh` and edit the following — these are the only settings you 
 export GWASPHERE_BASE_DIR="/path/to/gwasphere"
 
 # Java — edit if 'java' is not in your PATH
-export NXF_JAVA_HOME="path/to/java/"
+export NXF_JAVA_HOME="/path/to/java/"
 # Nextflow — edit if 'nextflow' is not in your PATH
-export NEXTFLOW_BIN="path/to/nextflow"
+export NEXTFLOW_BIN="/path/to/nextflow"
 
 # Edit if you want a different port (default: 3838):
 # PORT=4242

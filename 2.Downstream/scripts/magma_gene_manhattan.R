@@ -52,13 +52,18 @@ for (f in files) {
 
   if (nrow(dt) == 0) next
 
+  # Sort by chromosome and position before computing cumulative positions
+  setorder(dt, CHR, MID)
+
   # Cumulative position
   chr_len <- dt[, .(CHR_len = max(MID)), by = CHR]
+  chr_len <- chr_len[order(CHR)]
   chr_len[, tot := cumsum(as.numeric(CHR_len)) - CHR_len]
   dt <- merge(dt, chr_len[, .(CHR, tot)], by = "CHR")
   dt[, MIDcum := MID + tot]
 
   axisdf <- dt[, .(center = (max(MIDcum) + min(MIDcum)) / 2), by = CHR]
+  axisdf <- axisdf[order(CHR)]
 
   # Colour by chromosome (alternating)
   dt[, col_group := ifelse(CHR %% 2 == 0, "even", "odd")]
@@ -105,6 +110,7 @@ for (f in files) {
         tickmode = "array",
         tickvals = axisdf$center,
         ticktext = axisdf$CHR,
+        tickangle = 0,
         showgrid = FALSE, zeroline = FALSE
       ),
       yaxis = list(
